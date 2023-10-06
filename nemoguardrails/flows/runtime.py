@@ -16,6 +16,7 @@
 import inspect
 import logging
 import uuid
+from textwrap import indent
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
@@ -31,7 +32,10 @@ from nemoguardrails.actions.math import wolfram_alpha_request
 from nemoguardrails.actions.output_moderation import output_moderation
 from nemoguardrails.actions.retrieve_relevant_chunks import retrieve_relevant_chunks
 from nemoguardrails.flows.flows import FlowConfig, compute_context, compute_next_steps
+from nemoguardrails.language.parser import parse_colang_file
+from nemoguardrails.llm.taskmanager import LLMTaskManager
 from nemoguardrails.rails.llm.config import RailsConfig
+from nemoguardrails.utils import new_event_dict
 
 log = logging.getLogger(__name__)
 
@@ -43,77 +47,81 @@ class Runtime:
         self.config = config
         self.verbose = verbose
 
-        # The dictionary of registered actions, initialized with default ones.
-        self.registered_actions = {
-            "wolfram alpha request": wolfram_alpha_request,
-            "check_facts": check_facts,
-            "check_jailbreak": check_jailbreak,
-            "output_moderation": output_moderation,
-            "check_hallucination": check_hallucination,
-            "retrieve_relevant_chunks": retrieve_relevant_chunks,
-        }
-
         # Register the actions with the dispatcher.
         self.action_dispatcher = ActionDispatcher(config_path=config.config_path)
-        for action_name, action_fn in self.registered_actions.items():
-            self.action_dispatcher.register_action(action_fn, action_name)
 
         # The list of additional parameters that can be passed to the actions.
         self.registered_action_params = {}
 
         self._init_flow_configs()
 
+        # Initialize the prompt renderer as well.
+        self.llm_task_manager = LLMTaskManager(config)
+
+    def _load_flow_config(self, flow: dict):
+        """Loads a flow into the list of flow configurations."""
+        elements = flow["elements"]
+
+        # If we have an element with meta information, we move the relevant properties
+        # to top level.
+        if elements and elements[0].get("_type") == "meta":
+            meta_data = elements[0]["meta"]
+
+            if "priority" in meta_data:
+                flow["priority"] = meta_data["priority"]
+            if "is_extension" in meta_data:
+                flow["is_extension"] = meta_data["is_extension"]
+            if "interruptable" in meta_data:
+                flow["is_interruptible"] = meta_data["interruptable"]
+
+            # Finally, remove the meta element
+            elements = elements[1:]
+
+        # If we don't have an id, we generate a random UID.
+        flow_id = flow.get("id") or str(uuid.uuid4())
+
+        self.flow_configs[flow_id] = FlowConfig(
+            id=flow_id,
+            elements=elements,
+            priority=flow.get("priority", 1.0),
+            is_extension=flow.get("is_extension", False),
+            is_interruptible=flow.get("is_interruptible", True),
+            source_code=flow.get("source_code"),
+        )
+
+        # We also compute what types of events can trigger this flow, in addition
+        # to the default ones.
+        for element in elements:
+            if element.get("UtteranceUserActionFinished"):
+                self.flow_configs[flow_id].trigger_event_types.append(
+                    "UtteranceUserActionFinished"
+                )
+
     def _init_flow_configs(self):
         """Initializes the flow configs based on the config."""
         self.flow_configs = {}
 
         for flow in self.config.flows:
-            elements = flow["elements"]
+            self._load_flow_config(flow)
 
-            # If we have an element with meta information, we move the relevant properties
-            # to top level.
-            if elements and elements[0].get("_type") == "meta":
-                meta_data = elements[0]["meta"]
-
-                if "priority" in meta_data:
-                    flow["priority"] = meta_data["priority"]
-                if "is_extension" in meta_data:
-                    flow["is_extension"] = meta_data["is_extension"]
-                if "interruptable" in meta_data:
-                    flow["is_interruptible"] = meta_data["interruptable"]
-
-                # Finally, remove the meta element
-                elements = elements[1:]
-
-            # If we don't have an id, we generate a random UID.
-            flow_id = flow.get("id") or str(uuid.uuid4())
-
-            self.flow_configs[flow_id] = FlowConfig(
-                id=flow_id,
-                elements=elements,
-                priority=flow.get("priority", 1.0),
-                is_extension=flow.get("is_extension", False),
-                is_interruptible=flow.get("is_interruptible", True),
-                source_code=flow.get("source_code"),
-            )
-
-            # We also compute what types of events can trigger this flow, in addition
-            # to the default ones.
-            for element in elements:
-                if element.get("user_said"):
-                    self.flow_configs[flow_id].trigger_event_types.append("user_said")
-
-    def register_action(self, action: callable, name: Optional[str] = None):
+    def register_action(
+        self, action: callable, name: Optional[str] = None, override: bool = True
+    ):
         """Registers an action with the given name.
 
         :param name: The name of the action.
         :param action: The action function.
+        :param override: If an action already exists, whether it should be overriden or not.
         """
-        self.action_dispatcher.register_action(action, name)
+        self.action_dispatcher.register_action(action, name, override=override)
 
-    def register_actions(self, actions_obj: any):
+    def register_actions(self, actions_obj: any, override: bool = True):
         """Registers all the actions from the given object."""
-        self.action_dispatcher.register_actions(actions_obj)
+        self.action_dispatcher.register_actions(actions_obj, override=override)
+
+    @property
+    def registered_actions(self):
+        return self.action_dispatcher.registered_actions
 
     def register_action_param(self, name: str, value: any):
         """Registers an additional parameter that can be passed to the actions.
@@ -139,23 +147,35 @@ class Runtime:
 
             log.info("Processing event: %s", last_event)
 
+            event_type = last_event["type"]
+            log.info(
+                "Event :: %s %s",
+                event_type,
+                str({k: v for k, v in last_event.items() if k != "type"}),
+            )
+
             # If we need to execute an action, we start doing that.
-            if last_event["type"] == "start_action":
+            if last_event["type"] == "StartInternalSystemAction":
                 next_events = await self._process_start_action(events)
+
+            # If we need to start a flow, we parse the content and register it.
+            elif last_event["type"] == "start_flow":
+                next_events = await self._process_start_flow(events)
+
             else:
                 # We need to slide all the flows based on the current event,
                 # to compute the next steps.
                 next_events = await self.compute_next_steps(events)
 
                 if len(next_events) == 0:
-                    next_events = [{"type": "listen"}]
+                    next_events = [new_event_dict("Listen")]
 
             # Otherwise, we append the event and continue the processing.
             events.extend(next_events)
             new_events.extend(next_events)
 
             # If the next event is a listen, we stop the processing.
-            if next_events[-1]["type"] == "listen":
+            if next_events[-1]["type"] == "Listen":
                 break
 
             # As a safety measure, we stop the processing if we have too many events.
@@ -168,9 +188,9 @@ class Runtime:
         """Computes the next step based on the current flow."""
         next_steps = compute_next_steps(events, self.flow_configs)
 
-        # If there are any start_action events, we mark if they are system actions or not
+        # If there are any StartInternalSystemAction events, we mark if they are system actions or not
         for event in next_steps:
-            if event["type"] == "start_action":
+            if event["type"] == "StartInternalSystemAction":
                 is_system_action = False
                 fn = self.action_dispatcher.get_action(event["action_name"])
                 if fn:
@@ -186,12 +206,12 @@ class Runtime:
         return ActionResult(
             events=[
                 {
-                    "type": "bot_intent",
+                    "type": "BotIntent",
                     "intent": "inform internal error occurred",
                 },
                 {
-                    "type": "bot_said",
-                    "content": message,
+                    "type": "StartUtteranceBotAction",
+                    "script": message,
                 },
                 # We also want to hide this from now from the history moving forward
                 {"type": "hide_prev_turn"},
@@ -206,6 +226,7 @@ class Runtime:
         action_name = event["action_name"]
         action_params = event["action_params"]
         action_result_key = event["action_result_key"]
+        action_uid = event["action_uid"]
 
         context = {}
         action_meta = {}
@@ -241,7 +262,7 @@ class Runtime:
                 parameters = fn.input_keys
                 action_type = "chain"
 
-            # For every parameters that start with "__context__", we pass the value
+            # For every parameter that start with "__context__", we pass the value
             for parameter_name in parameters:
                 if parameter_name.startswith("__context__"):
                     var_name = parameter_name[11:]
@@ -272,11 +293,24 @@ class Runtime:
                 if "context" in parameters:
                     kwargs["context"] = context
 
+                if "config" in parameters:
+                    kwargs["config"] = self.config
+
+                if "llm_task_manager" in parameters:
+                    kwargs["llm_task_manager"] = self.llm_task_manager
+
                 # Add any additional registered parameters
                 for k, v in self.registered_action_params.items():
                     if k in parameters:
                         kwargs[k] = v
 
+                if (
+                    "llm" in kwargs
+                    and f"{action_name}_llm" in self.registered_action_params
+                ):
+                    kwargs["llm"] = self.registered_action_params[f"{action_name}_llm"]
+
+                log.info("Executing action :: %s", action_name)
                 result, status = await self.action_dispatcher.execute_action(
                     action_name, kwargs
                 )
@@ -312,19 +346,22 @@ class Runtime:
                     break
 
             if changes:
-                next_steps.append({"type": "context_update", "data": context_updates})
+                next_steps.append(new_event_dict("ContextUpdate", data=context_updates))
 
         next_steps.append(
-            {
-                "type": "action_finished",
-                "action_name": action_name,
-                "action_params": action_params,
-                "action_result_key": action_result_key,
-                "status": status,
-                "return_value": return_value,
-                "events": return_events,
-                "is_system_action": action_meta.get("is_system_action", False),
-            }
+            new_event_dict(
+                "InternalSystemActionFinished",
+                action_uid=action_uid,
+                action_name=action_name,
+                action_params=action_params,
+                action_result_key=action_result_key,
+                status=status,
+                is_success=status != "failed",
+                failure_reason=status,
+                return_value=return_value,
+                events=return_events,
+                is_system_action=action_meta.get("is_system_action", False),
+            )
         )
 
         # If the action returned additional events, we also add them to the next steps.
@@ -372,3 +409,35 @@ class Runtime:
         except Exception as e:
             log.info(f"Failed to get response from {action_name} due to exception {e}")
         return result, status
+
+    async def _process_start_flow(self, events: List[dict]) -> List[dict]:
+        """Starts a flow."""
+
+        event = events[-1]
+
+        flow_id = event["flow_id"]
+
+        # Up to this point, the body will be the sequence of instructions.
+        # We need to alter it to be an actual flow definition, i.e., add `define flow xxx`
+        # and intent the body.
+        body = event["flow_body"]
+        body = "define flow " + flow_id + ":\n" + indent(body, "  ")
+
+        # We parse the flow
+        parsed_data = parse_colang_file("dynamic.co", content=body)
+
+        assert len(parsed_data["flows"]) == 1
+        flow = parsed_data["flows"][0]
+
+        # To make sure that the flow will start now, we add a start_flow element at
+        # the beginning as well.
+        flow["elements"].insert(0, {"_type": "start_flow", "flow_id": flow_id})
+
+        # We add the flow to the list of flows.
+        self._load_flow_config(flow)
+
+        # And we compute the next steps. The new flow should match the current event,
+        # and start.
+        next_steps = await self.compute_next_steps(events)
+
+        return next_steps

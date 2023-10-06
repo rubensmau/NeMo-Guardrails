@@ -61,6 +61,24 @@ define bot ask welfare
 
 If more than one utterance is specified per bot message, the meaning is that one of them should be chosen randomly.
 
+##### Bot Messages with Variables
+
+The utterance definition can also include reference to variables (see the [Variables](#variables) section below).
+
+```colang
+define bot express greeting
+  "Hello there, $name!"
+```
+
+Alternatively, you can also use the Jinja syntax:
+
+```colang
+define bot express greeting
+  "Hello there, {{ name }}!"
+```
+
+**NOTE**: for more advanced use cases you can also use other Jinja features like `{% if ... %} ... {% endif %}`.
+
 #### Flows
 
 Flows represent how you want the conversation to unfold. It includes sequences of user messages, bot messages and potentially other events.
@@ -103,6 +121,27 @@ define flow hello
 ```
 
 The `if/else` statement can be used to evaluate expressions involving context variables and alter the flow accordingly. The `when/else` statement can be used to branch the flow based on next user message/event.
+
+#### Subflows
+
+Subflows are a particular type of flows. While flows are meant to be applied automatically to the current conversation (when there is a match), subflows are meant to be called explicitly by other flows/subflows. A subflow can be invoked using the `do` keyword and the name of the subflow:
+
+```colang
+
+define subflow check user authentication
+  if not $user_auth
+    bot inform authentication required
+    bot ask name
+    ...
+
+define flow greeting
+  """We first authenticate the user, before continuing"""
+  user express greeting
+  do check user authentication
+  bot express greeting
+```
+
+Subflows should be used for reusable pieces of conversational logic, e.g., authentication, form filling.
 
 #### Variables
 

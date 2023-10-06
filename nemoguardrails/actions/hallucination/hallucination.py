@@ -14,14 +14,22 @@
 # limitations under the License.
 
 import logging
-import random
-import textwrap
 from typing import Optional
 
 from langchain import LLMChain, PromptTemplate
-from langchain.llms import BaseLLM, OpenAI
+from langchain.llms import OpenAI
+from langchain.llms.base import BaseLLM
 
-from nemoguardrails.actions.llm.utils import get_multiline_response, strip_quotes
+from nemoguardrails.actions.llm.utils import (
+    get_multiline_response,
+    llm_call,
+    strip_quotes,
+)
+from nemoguardrails.llm.params import llm_params
+from nemoguardrails.llm.taskmanager import LLMTaskManager
+from nemoguardrails.llm.types import Task
+from nemoguardrails.logging.callbacks import logging_callback_manager_for_chain
+from nemoguardrails.rails.llm.config import RailsConfig
 
 log = logging.getLogger(__name__)
 
@@ -29,12 +37,15 @@ HALLUCINATION_NUM_EXTRA_RESPONSES = 2
 
 
 async def check_hallucination(
+    llm_task_manager: LLMTaskManager,
     context: Optional[dict] = None,
     llm: Optional[BaseLLM] = None,
     use_llm_checking: bool = True,
 ):
-    """Checks if the last bot response is a hallucination by checking
-    multiple completions for self-consistency."""
+    """Checks if the last bot response is a hallucination by checking multiple completions for self-consistency.
+
+    :return: True if hallucination is detected, False otherwise.
+    """
 
     bot_response = context.get("last_bot_message")
     last_bot_prompt_string = context.get("_last_bot_prompt")
@@ -44,21 +55,23 @@ async def check_hallucination(
         # Use beam search for the LLM call, to get several completions with only one call.
         # At the current moment, only OpenAI LLM engines are supported for computing the additional completions.
         if type(llm) != OpenAI:
-            log.warning(f"Hallucination rail can only be used with OpenAI LLM engines.")
+            log.warning(
+                f"Hallucination rail can only be used with OpenAI LLM engines."
+                f"Current LLM engine is {type(llm).__name__}."
+            )
             return False
-
-        # Use the same model name as the original OpenAI LLM engine.
-        extra_llm = OpenAI(
-            model_name=llm.model_name,
-            temperature=1,
-            n=num_responses,
-            best_of=num_responses,
-        )
 
         # Use the "generate" call from langchain to get all completions in the same response.
         last_bot_prompt = PromptTemplate(template="{text}", input_variables=["text"])
-        chain = LLMChain(prompt=last_bot_prompt, llm=extra_llm)
-        extra_llm_response = await chain.agenerate([{"text": last_bot_prompt_string}])
+        chain = LLMChain(prompt=last_bot_prompt, llm=llm)
+
+        # Generate multiple responses with temperature 1.
+        with llm_params(llm, temperature=1.0, n=num_responses, best_of=num_responses):
+            extra_llm_response = await chain.agenerate(
+                [{"text": last_bot_prompt_string}],
+                run_manager=logging_callback_manager_for_chain,
+            )
+
         extra_llm_completions = []
         if len(extra_llm_response.generations) > 0:
             extra_llm_completions = extra_llm_response.generations[0]
@@ -87,23 +100,16 @@ async def check_hallucination(
 
         if use_llm_checking:
             # Only support LLM-based agreement check in current version
-            hallucination_check_template = textwrap.dedent(
-                """
-            You are given a task to identify if the hypothesis is in agreement with the context below.
-            You will only use the contents of the context and not rely on external knowledge.
-            Answer with yes/no. "context": {paragraph} "hypothesis": {statement} "agreement":
-            """
+            prompt = llm_task_manager.render_task_prompt(
+                task=Task.CHECK_HALLUCINATION,
+                context={
+                    "statement": bot_response,
+                    "paragraph": ". ".join(extra_responses),
+                },
             )
 
-            prompt = PromptTemplate(
-                template=hallucination_check_template,
-                input_variables=["statement", "paragraph"],
-            )
-
-            hallucination_check_chain = LLMChain(prompt=prompt, llm=llm, verbose=True)
-            agreement = await hallucination_check_chain.apredict(
-                statement=bot_response, paragraph=". ".join(extra_responses)
-            )
+            with llm_params(llm, temperature=0.0):
+                agreement = await llm_call(llm, prompt)
 
             agreement = agreement.lower().strip()
             log.info(f"Agreement result for looking for hallucination is {agreement}.")

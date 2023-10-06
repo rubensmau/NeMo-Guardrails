@@ -14,19 +14,22 @@
 # limitations under the License.
 
 import logging
-import random
 from typing import Optional
 
-from langchain import LLMChain, PromptTemplate
-from langchain.llms import BaseLLM
+from langchain.llms.base import BaseLLM
 
 from nemoguardrails.actions import action
+from nemoguardrails.actions.llm.utils import llm_call
+from nemoguardrails.llm.params import llm_params
+from nemoguardrails.llm.taskmanager import LLMTaskManager
+from nemoguardrails.llm.types import Task
 
 log = logging.getLogger(__name__)
 
 
 @action(is_system_action=True)
 async def output_moderation(
+    llm_task_manager: LLMTaskManager,
     context: Optional[dict] = None,
     llm: Optional[BaseLLM] = None,
 ):
@@ -34,18 +37,20 @@ async def output_moderation(
 
     bot_response = context.get("last_bot_message")
     if bot_response:
-        output_moderation_template = "model_output: {bot_response} \n\n Is this output legal, ethical and not harmful to any person? Answer with yes/no."
-
-        prompt = PromptTemplate(
-            template=output_moderation_template, input_variables=["bot_response"]
+        prompt = llm_task_manager.render_task_prompt(
+            task=Task.OUTPUT_MODERATION,
+            context={
+                "bot_response": bot_response,
+            },
         )
 
-        output_moderation_chain = LLMChain(prompt=prompt, llm=llm)
-        check = await output_moderation_chain.apredict(bot_response=bot_response)
+        with llm_params(llm, temperature=0.0):
+            check = await llm_call(llm, prompt)
 
         check = check.lower().strip()
         log.info(f"Output moderation check result is {check}.")
 
         if "no" in check:
             return False
+
     return True

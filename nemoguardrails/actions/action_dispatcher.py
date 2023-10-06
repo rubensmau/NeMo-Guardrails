@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from langchain.chains.base import Chain
 
+from nemoguardrails.logging.callbacks import logging_callbacks
+
 log = logging.getLogger(__name__)
 
 
@@ -59,6 +61,10 @@ class ActionDispatcher:
         log.info(f"Registered Actions: {self._registered_actions}")
         log.info("Action dispatcher initialized")
 
+    @property
+    def registered_actions(self):
+        return self._registered_actions
+
     def load_actions_from_path(self, path: str):
         """Loads all actions from the specified path.
 
@@ -75,26 +81,33 @@ class ActionDispatcher:
                 self._load_actions_from_module(actions_py_path)
             )
 
-    def register_action(self, action: callable, name: Optional[str] = None):
+    def register_action(
+        self, action: callable, name: Optional[str] = None, override: bool = True
+    ):
         """Registers an action with the given name.
 
         :param name: The name of the action.
         :param action: The action function.
+        :param override: If an action already exists, whether it should be overriden or not.
         """
         if name is None:
             action_meta = getattr(action, "action_meta", None)
             name = action_meta["name"] if action_meta else action.__name__
 
+        # If we're not allowed to override, we stop.
+        if name in self._registered_actions and not override:
+            return
+
         self._registered_actions[name] = action
 
-    def register_actions(self, actions_obj: any):
+    def register_actions(self, actions_obj: any, override: bool = True):
         """Registers all the actions from the given object."""
         # Register the actions
         for attr in dir(actions_obj):
             val = getattr(actions_obj, attr)
 
             if hasattr(val, "action_meta"):
-                self.register_action(val)
+                self.register_action(val, override=override)
 
     def get_action(self, name: str) -> callable:
         return self._registered_actions.get(name)
@@ -109,6 +122,13 @@ class ActionDispatcher:
         if action_name in self._registered_actions:
             log.info(f"Executing registered action: {action_name}")
             fn = self._registered_actions.get(action_name, None)
+
+            # Actions that are registered as classes are initialized lazy, when
+            # they are first used.
+            if inspect.isclass(fn):
+                fn = fn()
+                self._registered_actions[action_name] = fn
+
             if fn is not None:
                 try:
                     # We support both functions and classes as actions
@@ -116,7 +136,21 @@ class ActionDispatcher:
                         result = await fn(**params)
                     elif isinstance(fn, Chain):
                         try:
-                            result = await fn.arun(**params)
+                            chain = fn
+
+                            # For chains with only one output key, we use the `arun` function
+                            # to return directly the result.
+                            if len(chain.output_keys) == 1:
+                                result = await chain.arun(
+                                    **params, callbacks=logging_callbacks
+                                )
+                            else:
+                                # Otherwise, we return the dict with the output keys.
+                                result = await chain.acall(
+                                    inputs=params,
+                                    return_only_outputs=True,
+                                    callbacks=logging_callbacks,
+                                )
                         except NotImplementedError:
                             # Not ideal, but for now we fall back to sync execution
                             # if the async is not available
@@ -126,7 +160,7 @@ class ActionDispatcher:
                         result = fn.run(**params)
                     return result, "success"
                 except Exception as e:
-                    log.info(f"Error {e} while execution {action_name}")
+                    log.exception(f"Error {e} while execution {action_name}")
 
         return None, "failed"
 
@@ -157,7 +191,7 @@ class ActionDispatcher:
 
                 if inspect.isclass(obj) and hasattr(obj, "action_meta"):
                     try:
-                        action_objects[obj.action_meta["name"]] = obj()
+                        action_objects[obj.action_meta["name"]] = obj
                         log.info(f"Added {obj.action_meta['name']} to actions")
                     except Exception as e:
                         log.debug(
